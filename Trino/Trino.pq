@@ -63,6 +63,12 @@ shared TrinoType = type function (
         Documentation.FieldDescription = "The SQL query you want to execute to retrieve data.",
         Documentation.SampleValues = {"select custkey,name from tpch.sf1.customer"},
         Formatting.IsMultiLine = true
+    ]),
+    optional M2MToken as (type text meta [
+        DataSource.Path = false,
+        Documentation.FieldCaption = "OIDC Discovery Endpoint",
+        Documentation.FieldDescription = "OIDC Discovery Endpoint for Client Credentials (m2m) authentication. If provided, Basic Auth credentials are used as Client ID and Client Secret.",
+        Documentation.SampleValues = {"https://idp.example.com/.well-known/openid-configuration"}
     ])
     )
     as table meta [
@@ -76,12 +82,13 @@ DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
 Http = if (Extension.CurrentCredential()[AuthenticationKind]?) = "Implicit" then "http://" else "https://";
 
-TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text) as table =>
+TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text, optional OIDCDiscoveryEndpoint as text) as table =>
     let
         Url = Http & Host & ":" & Number.ToText(Port) & "/v1/statement",
+        M2MToken = if (OIDCDiscoveryEndpoint <> null and Extension.CurrentCredential()[AuthenticationKind]? = "UsernamePassword") then GetM2MToken(OIDCDiscoveryEndpoint, Extension.CurrentCredential()[Username], Extension.CurrentCredential()[Password]) else null,
         Table = 
             if SQLQuery is null then 
-                TrinoNavTable(Url, Catalog, User, Retries, Timeout, TargetResultSize)
+                TrinoNavTable(Url, Catalog, User, Retries, Timeout, TargetResultSize, M2MToken)
             else 
                 let
                     User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
@@ -93,10 +100,15 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                         (iteration) =>
                             let
                                 isRetry = if iteration > 0 then true else false,
+
+                                authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                                manualCredentials = if (M2MToken <> null) then true else null,
                                 response = Web.Contents(Url,
                                     [
                                         Content = Text.ToBinary(SQLQuery)
-                                        ,Headers = [#"X-Trino-User" = User]
+                                        ,Headers = authHeaders
+                                        ,ManualCredentials = manualCredentials
                                         ,Timeout = #duration(0, 0, 0, Timeout)
                                         ,IsRetry = isRetry
                                     ]
@@ -117,16 +129,21 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
         Table;
 
 
-PostStatementCatalogs = (url as text, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number) as table =>    
+PostStatementCatalogs = (url as text, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("show catalogs")
-                                ,Headers = [#"X-Trino-User" = User]
+                                 ,Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry
                             ]
@@ -139,20 +156,25 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize,M2MToken)
      in
         if Catalog = null then Source else #table({"Catalog"}, {{Catalog}});
 
-PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table  =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("select schema_name from """ & Catalog & """.information_schema.schemata")
-                                ,Headers = [#"X-Trino-User" = User]
+                                 ,Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry
                             ]
@@ -165,20 +187,25 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize,M2MToken)
      in
         Source;
 
-PostStatementTables = (url as text, Catalog as text, Schema as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementTables = (url as text, Catalog as text, Schema as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table  =>
     let
         response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select table_name, table_schema from """ & Catalog & """.information_schema.tables where table_schema = '" & Schema & "'")
-                                ,Headers = [#"X-Trino-User" = User]
+                                 ,Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry                                
                             ]
@@ -191,21 +218,26 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize,M2MToken)
 
      in
         Source;
 
-PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  => 
+PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table  =>
     let      
        response = Value.WaitFor(
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
-                                ,Headers = [#"X-Trino-User" = User]
+                                 ,Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry
                             ]
@@ -218,11 +250,11 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize,M2MToken)
      in
         Source;
 
-PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table  =>
     let   
         //get and prepare column names
         ColumnNamesTable = PostStatementQueryColumnNames(url,Catalog,schema,table,User,Retries,Timeout,TargetResultSize),
@@ -238,10 +270,15 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")
-                                ,Headers = [#"X-Trino-User" = User]
+                                 ,Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry
                             ]
@@ -254,11 +291,11 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize,M2MToken)
      in
         Source;
 
-GetPage = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
+GetPage = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table =>
     let        
         Query = 
             if TargetResultSize <> null then
@@ -269,9 +306,14 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                 (iteration) =>
                     let
                         isRetry = if iteration > 0 then true else false,
+
+                        authHeaders = if (M2MToken <> null) then [#"X-Trino-User" = User, #"Authorization" = "Bearer " & M2MToken] else [#"X-Trino-User" = User],
+
+                        manualCredentials = if (M2MToken <> null) then true else null,
                         response = Web.Contents(url, 
                             [
-                                 Headers = [#"X-Trino-User" = User]
+                                 Headers = authHeaders
+                                 ,ManualCredentials = manualCredentials
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = isRetry   
                                 ,Query = Query                          
@@ -357,7 +399,7 @@ TrinoNavTable = (url as text, optional Catalog as text, optional User as text, o
                else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
-        catalogs = PostStatementCatalogs(url,Catalog,User,Retries,Timeout,TargetResultSize),
+        catalogs = PostStatementCatalogs(url,Catalog,User,Retries,Timeout,TargetResultSize,M2MToken),
         catalogsRename = Table.RenameColumns(catalogs, {Table.ColumnNames(#"catalogs"){0},"Name"}),
         catalogsRenameSort = Table.Sort(catalogsRename, {"Name"}),
         NameKeyColumn = Table.DuplicateColumn(catalogsRenameSort,"Name","NameKey", type text),
@@ -366,13 +408,14 @@ TrinoNavTable = (url as text, optional Catalog as text, optional User as text, o
         RetriesColumn = Table.AddColumn(UserColumn,"Retries", each Retries),
         TimeoutColumn = Table.AddColumn(RetriesColumn,"Timeout", each Timeout),
         TargetResultSizeColumn = Table.AddColumn(TimeoutColumn,"TargetResultSize", each TargetResultSize),
+        M2MTokenColumn = Table.AddColumn(TargetResultSizeColumn,"M2MToken", each M2MToken),
         //DataColumn = Table.AddColumn(UrlColumn ,"Data", each TrinoNavTableLeaf(url,[Name])),
-        ItemKindColumn = Table.AddColumn(TargetResultSizeColumn,"ItemKind", each "Database"),
+        ItemKindColumn = Table.AddColumn(M2MTokenColumn,"ItemKind", each "Database"),
         ItemNameColumn = Table.AddColumn(ItemKindColumn,"ItemName", each "Database"),
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each false),
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeaf, [
+        AsNavigationView = Table.NavigationTableView(() => source, {"Url","NameKey","User","Retries","Timeout","TargetResultSize","M2MToken"}, TrinoNavTableLeaf, [
             Name = each [Name],
             ItemKind = each [ItemKind],
             ItemName = each [ItemName],
@@ -381,14 +424,14 @@ TrinoNavTable = (url as text, optional Catalog as text, optional User as text, o
     in
         AsNavigationView;
 
-TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
+TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional M2MToken as text)  as table =>
     let      
         User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
                else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
                else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
-        schemas = PostStatementSchemas(url,Catalog,User,Retries,Timeout,TargetResultSize),
+        schemas = PostStatementSchemas(url,Catalog,User,Retries,Timeout,TargetResultSize,M2MToken),
         schemasConc = Table.AddColumn(schemas, "Name", each [schema_name]),
         tablesConcSort = Table.Sort(schemasConc, {"Name"}),        
         NameKeyColumn = Table.DuplicateColumn(tablesConcSort,"Name","NameKey", type text),
@@ -398,13 +441,14 @@ TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, option
         RetriesColumn = Table.AddColumn(UserColumn,"Retries", each Retries),
         TimeoutColumn = Table.AddColumn(RetriesColumn,"Timeout", each Timeout),
         TargetResultSizeColumn = Table.AddColumn(TimeoutColumn,"TargetResultSize", each TargetResultSize),
+        M2MTokenColumn = Table.AddColumn(TargetResultSizeColumn,"M2MToken", each M2MToken),
         //DataColumn = Table.AddColumn(UrlColumn,"Data", each TrinoNavTableLeafLeaf(url,Catalog,[schema_name])),
-        ItemKindColumn = Table.AddColumn(TargetResultSizeColumn,"ItemKind", each "Folder"),
+        ItemKindColumn = Table.AddColumn(M2MTokenColumn,"ItemKind", each "Folder"),
         ItemNameColumn = Table.AddColumn(ItemKindColumn,"ItemName", each "Folder"),
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each false),
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf"),
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","NameKey","User","Retries","Timeout","TargetResultSize"}, TrinoNavTableLeafLeaf, [
+        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","NameKey","User","Retries","Timeout","TargetResultSize","M2MToken"}, TrinoNavTableLeafLeaf, [
             Name = each [Name],
             ItemKind = each [ItemKind],
             ItemName = each [ItemName],
@@ -413,14 +457,14 @@ TrinoNavTableLeaf = (url as text, Catalog as text, optional User as text, option
     in
         AsNavigationView;
 
-TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number)  as table =>
+TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional M2MToken as text)  as table =>
     let
         User = if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) <> "UsernamePassword" then DefaultUser 
                else if User is null and (Extension.CurrentCredential()[AuthenticationKind]?) = "UsernamePassword" then Extension.CurrentCredential()[Username] 
                else User,
         Retries = if Retries is null then DefaultRetries else Retries,
         Timeout = if Timeout is null then DefaultTimeout else Timeout,
-        tables = PostStatementTables(url,Catalog,Schema,User,Retries,Timeout,TargetResultSize),
+        tables = PostStatementTables(url,Catalog,Schema,User,Retries,Timeout,TargetResultSize,M2MToken),
         tablesConc = Table.AddColumn(tables, "Name", each [table_schema] & "." & [table_name]),
         tablesConcSort = Table.Sort(tablesConc, {"Name"}),   
         NameKeyColumn = Table.DuplicateColumn(tablesConcSort,"Name","NameKey", type text),
@@ -432,14 +476,15 @@ TrinoNavTableLeafLeaf = (url as text, Catalog as text, Schema as text, optional 
         RetriesColumn = Table.AddColumn(UserColumn,"Retries", each Retries),
         TimeoutColumn = Table.AddColumn(RetriesColumn,"Timeout", each Timeout),
         TargetResultSizeColumn = Table.AddColumn(TimeoutColumn,"TargetResultSize", each TargetResultSize),
+        M2MTokenColumn = Table.AddColumn(TargetResultSizeColumn,"M2MToken", each M2MToken),
         //DataColumn = Table.AddColumn(tablesConcSort,"Data", each Diagnostics.LogFailure("Error in GetEntity", () => PostStatementQueryTables(url,Catalog,[table_schema],[table_name]))),
         //DataColumn = Table.AddColumn(tablesConcSort,"Data", each PostStatementQueryTables(url,Catalog,[table_schema],[table_name])),
-        ItemKindColumn = Table.AddColumn(TargetResultSizeColumn,"ItemKind", each "Table"),
+        ItemKindColumn = Table.AddColumn(M2MTokenColumn,"ItemKind", each "Table"),
         ItemNameColumn = Table.AddColumn(ItemKindColumn,"ItemName", each "Table"),
         IsLeafColumn = Table.AddColumn(ItemNameColumn,"IsLeaf", each true),        
         source = IsLeafColumn,
         //navTable = Table.ToNavigationTable(source, {"Name"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
-        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","Schema","Table","User","Retries","Timeout","TargetResultSize"},  PostStatementQueryTables, [
+        AsNavigationView = Table.NavigationTableView(() => source, {"Url","Catalog","Schema","Table","User","Retries","Timeout","TargetResultSize","M2MToken"},  PostStatementQueryTables, [
              Name = each [Name],
              ItemKind = each [ItemKind],
              ItemName = each [ItemName],
@@ -469,8 +514,9 @@ Trino = [
             FinishLogin = FinishLogin
         ],
         UsernamePassword = [
-            UsernameLabel = Extension.LoadString("UsernameLabelText"),
-            PasswordLabel = Extension.LoadString("PasswordLabelText")
+            UsernameLabel = "Username / Client ID",
+            PasswordLabel = "Password / Client Secret",
+            Label = "Basic / Client Credentials"
         ],   
         Implicit = []
     ],  
@@ -549,6 +595,33 @@ Trino.Icons = [
 // HELPER FUNCTIONS //
 //////////////////////
 
+GetM2MToken = (oidcDiscoveryUrl as text, clientId as text, clientSecret as text) as text =>
+    let
+        // 1. Fetch token_endpoint from OIDC Discovery Endpoint
+        oidcResponse = Web.Contents(oidcDiscoveryUrl),
+        oidcJson = Json.Document(oidcResponse),
+        tokenEndpoint = oidcJson[#"token_endpoint"],
+
+        // 2. Request Token using client credentials
+        TokenResponse = Web.Contents(tokenEndpoint, [
+            Content = Text.ToBinary(Uri.BuildQueryString([
+                grant_type = "client_credentials",
+                client_id = clientId,
+                client_secret = clientSecret
+            ])),
+            Headers=[
+                #"Content-Type" = "application/x-www-form-urlencoded",
+                #"Accept" = "application/json"
+            ],
+            ManualCredentials = true
+        ]),
+        TokenJson = Json.Document(TokenResponse),
+        AccessToken = TokenJson[#"access_token"]
+    in
+        AccessToken;
+
+
+
 // In this implementation, 'response' will be the parsed body of the response after the call to Json.Document.
 // Look for the 'nextUri' field and simply return null if it doesn't exist.
 GetNextLink = (response) as nullable text => Record.FieldOrDefault(response, "nextUri");
@@ -556,14 +629,14 @@ GetNextLink = (response) as nullable text => Record.FieldOrDefault(response, "ne
 // Read all pages of data.
 // After every page, we check the "NextLink" record on the metadata of the previous request.
 // Table.GenerateByPage will keep asking for more pages until we return null.
-GetAllPagesByNextLink = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>    
+GetAllPagesByNextLink = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number, optional M2MToken as text) as table =>
     Table.GenerateByPage((previous) => 
         let
             User = if User is null then DefaultUser else User,
             // if previous is null, then this is our first page of data
             nextLink = if (previous = null) then url else Value.Metadata(previous)[NextLink]?,
             // if NextLink was set to null by the previous call, we know we have no more data
-            page = if (nextLink <> null) then GetPage(nextLink,User,Retries,Timeout,TargetResultSize) else null
+            page = if (nextLink <> null) then GetPage(nextLink,User,Retries,Timeout,TargetResultSize,M2MToken) else null
         in
             page
     );
